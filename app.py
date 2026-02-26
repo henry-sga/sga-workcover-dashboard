@@ -13,6 +13,12 @@ st.set_page_config(
 db.init_db()
 db.seed_data()
 
+# --- Session state ---
+if "dashboard_filter" not in st.session_state:
+    st.session_state.dashboard_filter = None
+if "selected_case_id" not in st.session_state:
+    st.session_state.selected_case_id = None
+
 # --- Helpers ---
 
 def get_cases_df():
@@ -109,7 +115,21 @@ def coc_status(cert_to_str):
         return f"Current ({delta}d left)", "green"
 
 
+def capacity_icon(cap):
+    if not cap:
+        return "\u26aa"
+    cap_lower = cap.lower()
+    if "no capacity" in cap_lower:
+        return "\U0001f534"  # red
+    elif "full" in cap_lower or "clearance" in cap_lower or "cleared" in cap_lower:
+        return "\U0001f7e2"  # green
+    elif "modified" in cap_lower:
+        return "\U0001f7e0"  # orange
+    return "\u26aa"  # white
+
+
 def capacity_color(cap):
+    """Return a color name for st.progress etc."""
     if not cap:
         return "gray"
     cap_lower = cap.lower()
@@ -123,7 +143,12 @@ def capacity_color(cap):
 
 
 def priority_emoji(p):
-    return {"HIGH": ":red_circle:", "MEDIUM": ":orange_circle:", "LOW": ":green_circle:"}.get(p, ":white_circle:")
+    return {"HIGH": "\U0001f534", "MEDIUM": "\U0001f7e0", "LOW": "\U0001f7e2"}.get(p, "\u26aa")
+
+
+def coc_icon(cert_to_str):
+    _, color = coc_status(cert_to_str) if cert_to_str else ("", "red")
+    return {"red": "\U0001f534", "orange": "\U0001f7e0", "green": "\U0001f7e2"}.get(color, "\u26aa")
 
 
 # --- Sidebar ---
@@ -138,6 +163,14 @@ page = st.sidebar.radio(
     index=0
 )
 
+# Reset case selection when changing pages
+if "last_page" not in st.session_state:
+    st.session_state.last_page = page
+if st.session_state.last_page != page:
+    st.session_state.selected_case_id = None
+    st.session_state.dashboard_filter = None
+    st.session_state.last_page = page
+
 st.sidebar.divider()
 st.sidebar.caption("Filters")
 filter_state = st.sidebar.multiselect("State", ["VIC", "NSW", "QLD"], default=["VIC", "NSW", "QLD"])
@@ -151,165 +184,432 @@ filter_priority = st.sidebar.multiselect(
 )
 
 
+# --- Case detail renderer (reused across pages) ---
+
+def render_case_detail(case_id):
+    conn = db.get_connection()
+    case = pd.read_sql_query("SELECT * FROM cases WHERE id = ?", conn, params=(case_id,))
+    certs = pd.read_sql_query("SELECT * FROM certificates WHERE case_id = ? ORDER BY cert_to DESC", conn, params=(case_id,))
+    docs = pd.read_sql_query("SELECT * FROM documents WHERE case_id = ? ORDER BY doc_type", conn, params=(case_id,))
+    term = pd.read_sql_query("""
+        SELECT t.* FROM terminations t WHERE t.case_id = ?
+    """, conn, params=(case_id,))
+    log = pd.read_sql_query("""
+        SELECT * FROM activity_log WHERE case_id = ? ORDER BY created_at DESC LIMIT 20
+    """, conn, params=(case_id,))
+    conn.close()
+
+    if len(case) == 0:
+        st.error("Case not found")
+        return
+
+    c = case.iloc[0]
+    cap_col = capacity_color(c["current_capacity"])
+
+    # Back button
+    if st.button("\u2b05\ufe0f Back to cases"):
+        st.session_state.selected_case_id = None
+        st.rerun()
+
+    st.markdown(f"## :{cap_col}_circle: {c['worker_name']}")
+    st.caption(f"{c['state']} | {c['entity'] or ''} - {c['site'] or ''} | Priority: {c['priority']}")
+
+    # Key info tabs
+    tab_overview, tab_medical, tab_docs, tab_payroll, tab_history = st.tabs(
+        ["Overview", "Medical / COCs", "Documents", "Payroll", "History"]
+    )
+
+    with tab_overview:
+        oc1, oc2 = st.columns(2)
+        with oc1:
+            st.markdown("#### Case Details")
+            st.markdown(f"**Date of Injury:** {c['date_of_injury'] or 'N/A'}")
+            st.markdown(f"**Claim #:** {c['claim_number'] or 'N/A'}")
+            st.markdown(f"**Current Capacity:** {c['current_capacity']}")
+            st.markdown(f"**Shift Structure:** {c['shift_structure'] or 'N/A'}")
+            st.markdown(f"**PIAWE:** ${c['piawe']:,.2f}" if pd.notna(c['piawe']) else "**PIAWE:** Not recorded")
+            st.markdown(f"**Reduction Rate:** {c['reduction_rate'] or 'N/A'}")
+
+        with oc2:
+            st.markdown("#### Injury")
+            st.markdown(c['injury_description'] or 'N/A')
+
+            # COC status
+            if len(certs) > 0:
+                latest = certs.iloc[0]
+                status, color = coc_status(latest["cert_to"])
+                emoji = {"red": "\U0001f534", "orange": "\U0001f7e0", "green": "\U0001f7e2"}.get(color, "\u26aa")
+                st.markdown(f"#### Latest COC {emoji}")
+                st.markdown(f"**Period:** {latest['cert_from']} to {latest['cert_to']}")
+                st.markdown(f"**Status:** {status}")
+                st.markdown(f"**Capacity:** {latest['capacity'] or 'N/A'}")
+            else:
+                st.markdown("#### Latest COC \U0001f534")
+                st.markdown("No certificate on record")
+
+            # Termination status
+            if len(term) > 0:
+                t = term.iloc[0]
+                st.markdown("#### Termination")
+                steps_done = sum([bool(t["letter_drafted"]), bool(t["letter_sent"]), bool(t["response_received"])])
+                st.progress(steps_done / 3, text=f"{t['status']} - {steps_done}/3 steps")
+                st.markdown(f"**Type:** {t['termination_type']}")
+                st.markdown(f"**Assigned to:** {t['assigned_to']}")
+
+        st.divider()
+        st.markdown("#### Strategy")
+        st.markdown(c['strategy'] or 'N/A')
+        st.markdown("#### Next Action")
+        st.markdown(c['next_action'] or 'N/A')
+        st.markdown("#### Notes")
+        st.markdown(c['notes'] or 'None')
+
+        # Quick edit
+        st.divider()
+        with st.expander("Quick Edit"):
+            with st.form(f"quick_edit_{case_id}"):
+                qe1, qe2 = st.columns(2)
+                cap_options = ["No Capacity", "Modified Duties", "Full Capacity", "Uncertain", "Unknown"]
+                new_cap = qe1.selectbox("Capacity", cap_options,
+                    index=cap_options.index(c["current_capacity"]) if c["current_capacity"] in cap_options else 4)
+                pri_options = ["HIGH", "MEDIUM", "LOW"]
+                new_pri = qe2.selectbox("Priority", pri_options,
+                    index=pri_options.index(c["priority"]) if c["priority"] in pri_options else 1)
+                new_next = st.text_area("Next Action", value=c["next_action"] or "")
+                new_notes = st.text_area("Notes", value=c["notes"] or "")
+                if st.form_submit_button("Save"):
+                    conn = db.get_connection()
+                    conn.execute("""UPDATE cases SET current_capacity=?, priority=?, next_action=?, notes=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                                 (new_cap, new_pri, new_next, new_notes, case_id))
+                    conn.commit()
+                    conn.close()
+                    log_activity(case_id, "Case Updated", f"Capacity: {new_cap}, Priority: {new_pri}")
+                    st.success("Saved!")
+                    st.rerun()
+
+    with tab_medical:
+        st.markdown("#### Certificate of Capacity History")
+        if len(certs) > 0:
+            for _, cert in certs.iterrows():
+                status, color = coc_status(cert["cert_to"])
+                emoji = {"red": "\U0001f534", "orange": "\U0001f7e0", "green": "\U0001f7e2"}.get(color, "\u26aa")
+                with st.container(border=True):
+                    mc1, mc2, mc3 = st.columns([2, 2, 2])
+                    mc1.markdown(f"{emoji} **{cert['cert_from']}** to **{cert['cert_to']}**")
+                    mc2.markdown(f"Capacity: {cert['capacity'] or 'N/A'}")
+                    schedule = ""
+                    if cert["days_per_week"]:
+                        schedule += f"{cert['days_per_week']} days/wk"
+                    if cert["hours_per_day"]:
+                        schedule += f", {cert['hours_per_day']} hrs/day"
+                    mc3.markdown(schedule or "No schedule recorded")
+        else:
+            st.info("No certificates recorded for this case")
+
+        st.divider()
+        st.markdown("#### Add New COC")
+        with st.form(f"add_coc_case_{case_id}"):
+            ac1, ac2 = st.columns(2)
+            new_from = ac1.date_input("From")
+            new_to = ac2.date_input("To")
+            new_coc_cap = st.selectbox("Capacity", ["No Capacity", "Modified Duties", "Full Capacity", "Clearance"])
+            ac3, ac4 = st.columns(2)
+            new_days = ac3.number_input("Days/Week", min_value=0, max_value=7, value=0)
+            new_hours = ac4.number_input("Hours/Day", min_value=0.0, max_value=24.0, value=0.0, step=0.5)
+            if st.form_submit_button("Add COC"):
+                conn = db.get_connection()
+                conn.execute("""INSERT INTO certificates (case_id, cert_from, cert_to, capacity, days_per_week, hours_per_day)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (case_id, new_from.isoformat(), new_to.isoformat(), new_coc_cap,
+                     new_days if new_days > 0 else None, new_hours if new_hours > 0 else None))
+                conn.execute("UPDATE cases SET current_capacity=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (new_coc_cap, case_id))
+                conn.commit()
+                conn.close()
+                log_activity(case_id, "COC Added", f"COC {new_from} to {new_to} - {new_coc_cap}")
+                st.success("COC added!")
+                st.rerun()
+
+    with tab_docs:
+        st.markdown("#### Document Checklist")
+        if len(docs) > 0:
+            doc_changes = {}
+            dcols = st.columns(2)
+            for i, (_, doc) in enumerate(docs.iterrows()):
+                col = dcols[i % 2]
+                check = "\u2705" if doc["is_present"] else "\u274c"
+                doc_changes[doc["id"]] = col.checkbox(
+                    f"{check} {doc['doc_type']}", value=bool(doc["is_present"]), key=f"detail_doc_{doc['id']}"
+                )
+            if st.button("Save Checklist", key=f"save_docs_{case_id}"):
+                conn = db.get_connection()
+                for doc_id, present in doc_changes.items():
+                    conn.execute("UPDATE documents SET is_present=? WHERE id=?", (int(present), int(doc_id)))
+                conn.commit()
+                conn.close()
+                log_activity(case_id, "Documents Updated", "Checklist updated")
+                st.success("Saved!")
+                st.rerun()
+
+        present_count = len(docs[docs["is_present"] == 1]) if len(docs) > 0 else 0
+        total_docs = len(docs) if len(docs) > 0 else 1
+        st.progress(present_count / total_docs, text=f"{present_count}/{total_docs} documents on file")
+
+    with tab_payroll:
+        st.markdown("#### Payroll History")
+        conn = db.get_connection()
+        pay_hist = pd.read_sql_query(
+            "SELECT * FROM payroll_entries WHERE case_id = ? ORDER BY period_to DESC", conn, params=(case_id,)
+        )
+        conn.close()
+
+        if pd.notna(c["piawe"]) and c["reduction_rate"] in ("95%", "80%"):
+            rate = 0.95 if c["reduction_rate"] == "95%" else 0.80
+            entitled = c["piawe"] * rate
+            pc1, pc2, pc3 = st.columns(3)
+            pc1.metric("PIAWE", f"${c['piawe']:,.2f}")
+            pc2.metric("Rate", c["reduction_rate"])
+            pc3.metric("Weekly Entitlement", f"${entitled:,.2f}")
+        elif pd.notna(c["piawe"]):
+            st.metric("PIAWE", f"${c['piawe']:,.2f}")
+        else:
+            st.warning("PIAWE not recorded for this case")
+
+        if len(pay_hist) > 0:
+            st.dataframe(pay_hist[["period_from", "period_to", "piawe", "estimated_wages", "compensation_payable", "total_payable", "notes"]],
+                use_container_width=True, hide_index=True)
+        else:
+            st.info("No payroll entries for this case")
+
+    with tab_history:
+        st.markdown("#### Activity Log")
+        if len(log) > 0:
+            for _, entry in log.iterrows():
+                st.markdown(f"**{entry['created_at'][:16] if entry['created_at'] else ''}** - {entry['action']}: {entry['details'] or ''}")
+        else:
+            st.info("No activity recorded")
+
+
+def render_case_list(cases_to_show, title=""):
+    if title:
+        st.subheader(title)
+
+    if len(cases_to_show) == 0:
+        st.info("No cases match this filter")
+        return
+
+    for _, case in cases_to_show.iterrows():
+        cap_col = capacity_color(case["current_capacity"])
+        emoji = priority_emoji(case["priority"])
+        with st.container(border=True):
+            cc1, cc2, cc3, cc4 = st.columns([3, 2, 2, 1])
+            cc1.markdown(f"{emoji} **{case['worker_name']}**")
+            cc2.markdown(f":{cap_col}_circle: {case['current_capacity']}")
+            cc3.markdown(f"{case['state']} - {case['site'] or 'Unknown'}")
+            if cc4.button("Open", key=f"open_{case['id']}"):
+                st.session_state.selected_case_id = int(case["id"])
+                st.rerun()
+
+
 # ============================================================
 # DASHBOARD PAGE
 # ============================================================
 if page == "Dashboard":
-    st.title("Workcover Case Management Dashboard")
+    # If a case is selected, show its detail view
+    if st.session_state.selected_case_id:
+        render_case_detail(st.session_state.selected_case_id)
 
-    cases_df = get_cases_df()
-    active = cases_df[cases_df["status"] == "Active"]
-    cocs = get_latest_cocs()
-    terms = get_terminations()
-
-    # Key metrics row
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Active Cases", len(active))
-    col2.metric("No Capacity", len(active[active["current_capacity"] == "No Capacity"]))
-    col3.metric("Modified Duties", len(active[active["current_capacity"] == "Modified Duties"]))
-    col4.metric("Terminations Pending", len(terms[terms["status"] == "Pending"]))
-
-    # Count expired COCs
-    expired_count = 0
-    for _, row in cocs.iterrows():
-        status, _ = coc_status(row["cert_to"])
-        if "EXPIRED" in status:
-            expired_count += 1
-    col5.metric("Expired COCs", expired_count, delta=f"{expired_count} need attention", delta_color="inverse")
-
-    st.divider()
-
-    # Alerts section
-    st.subheader("Alerts & Actions Required")
-
-    alerts = []
-
-    # COC alerts
-    for _, row in cocs.iterrows():
-        status, color = coc_status(row["cert_to"])
-        if color in ("red", "orange"):
-            alerts.append({
-                "type": "COC",
-                "severity": "URGENT" if color == "red" else "WARNING",
-                "worker": row["worker_name"],
-                "message": f"COC {status}",
-                "action": "Obtain new Certificate of Capacity"
-            })
-
-    # Check for cases with no COC at all
-    cases_with_coc = set(cocs["case_id"].tolist()) if len(cocs) > 0 else set()
-    for _, case in active.iterrows():
-        if case["id"] not in cases_with_coc and case["current_capacity"] not in ("Full Capacity",):
-            alerts.append({
-                "type": "COC",
-                "severity": "WARNING",
-                "worker": case["worker_name"],
-                "message": "No COC on record",
-                "action": "Obtain Certificate of Capacity from insurer"
-            })
-
-    # Termination alerts
-    for _, t in terms.iterrows():
-        if t["status"] == "Pending":
-            alerts.append({
-                "type": "TERMINATION",
-                "severity": "ACTION",
-                "worker": t["worker_name"],
-                "message": f"Termination pending - {t['termination_type']}",
-                "action": f"Follow up with {t['assigned_to']}"
-            })
-
-    # Missing PIAWE
-    for _, case in active.iterrows():
-        if pd.isna(case["piawe"]) and case["current_capacity"] not in ("Full Capacity",) and case["reduction_rate"] != "N/A":
-            alerts.append({
-                "type": "PAYROLL",
-                "severity": "INFO",
-                "worker": case["worker_name"],
-                "message": "PIAWE data missing",
-                "action": "Obtain PIAWE from insurer for payroll calculation"
-            })
-
-    if alerts:
-        for alert in sorted(alerts, key=lambda x: {"URGENT": 0, "WARNING": 1, "ACTION": 2, "INFO": 3}[x["severity"]]):
-            icon = {"URGENT": ":rotating_light:", "WARNING": ":warning:", "ACTION": ":clipboard:", "INFO": ":information_source:"}[alert["severity"]]
-            color_map = {"URGENT": "red", "WARNING": "orange", "ACTION": "blue", "INFO": "gray"}
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([1, 3, 2])
-                c1.markdown(f"{icon} **{alert['severity']}**")
-                c2.markdown(f"**{alert['worker']}** - {alert['message']}")
-                c3.markdown(f"*{alert['action']}*")
     else:
-        st.success("No alerts - all cases are up to date!")
+        st.title("Workcover Case Management Dashboard")
 
-    st.divider()
+        cases_df = get_cases_df()
+        active = cases_df[cases_df["status"] == "Active"]
+        cocs = get_latest_cocs()
+        terms = get_terminations()
 
-    # Cases by state
-    st.subheader("Cases by State")
-    col1, col2, col3 = st.columns(3)
+        # Count expired COCs
+        expired_count = 0
+        expired_case_ids = set()
+        for _, row in cocs.iterrows():
+            status, _ = coc_status(row["cert_to"])
+            if "EXPIRED" in status:
+                expired_count += 1
+                expired_case_ids.add(row["case_id"])
+        # Also count cases with no COC
+        cases_with_coc = set(cocs["case_id"].tolist()) if len(cocs) > 0 else set()
+        for _, case in active.iterrows():
+            if case["id"] not in cases_with_coc and case["current_capacity"] not in ("Full Capacity",):
+                expired_count += 1
+                expired_case_ids.add(case["id"])
 
-    for col, state, color in [(col1, "VIC", "#D6E4F0"), (col2, "NSW", "#E2EFDA"), (col3, "QLD", "#FFF2CC")]:
-        state_cases = active[active["state"] == state]
-        with col:
-            st.markdown(f"### {state} ({len(state_cases)})")
-            for _, case in state_cases.iterrows():
-                cap_col = capacity_color(case["current_capacity"])
-                emoji = priority_emoji(case["priority"])
-                st.markdown(
-                    f"{emoji} **{case['worker_name']}**  \n"
-                    f":{cap_col}_circle: {case['current_capacity']} | {case['site'] or 'Unknown'}"
-                )
+        pending_terms = terms[terms["status"] == "Pending"]
+        term_case_ids = set(pending_terms["case_id"].tolist()) if len(pending_terms) > 0 else set()
+
+        # Clickable metrics
+        col1, col2, col3, col4, col5 = st.columns(5)
+
+        current_filter = st.session_state.dashboard_filter
+
+        with col1:
+            active_style = "primary" if current_filter == "all" else "secondary"
+            if st.button(f"**{len(active)}**\n\nActive Cases", key="btn_all", use_container_width=True, type=active_style):
+                st.session_state.dashboard_filter = None if current_filter == "all" else "all"
+                st.rerun()
+
+        with col2:
+            no_cap_count = len(active[active["current_capacity"] == "No Capacity"])
+            active_style = "primary" if current_filter == "no_capacity" else "secondary"
+            if st.button(f"**{no_cap_count}**\n\nNo Capacity", key="btn_nocap", use_container_width=True, type=active_style):
+                st.session_state.dashboard_filter = None if current_filter == "no_capacity" else "no_capacity"
+                st.rerun()
+
+        with col3:
+            mod_count = len(active[active["current_capacity"] == "Modified Duties"])
+            active_style = "primary" if current_filter == "modified" else "secondary"
+            if st.button(f"**{mod_count}**\n\nModified Duties", key="btn_mod", use_container_width=True, type=active_style):
+                st.session_state.dashboard_filter = None if current_filter == "modified" else "modified"
+                st.rerun()
+
+        with col4:
+            active_style = "primary" if current_filter == "terminations" else "secondary"
+            if st.button(f"**{len(pending_terms)}**\n\nTerminations Pending", key="btn_term", use_container_width=True, type=active_style):
+                st.session_state.dashboard_filter = None if current_filter == "terminations" else "terminations"
+                st.rerun()
+
+        with col5:
+            active_style = "primary" if current_filter == "expired_coc" else "secondary"
+            if st.button(f"**{expired_count}**\n\nExpired COCs", key="btn_coc", use_container_width=True, type=active_style):
+                st.session_state.dashboard_filter = None if current_filter == "expired_coc" else "expired_coc"
+                st.rerun()
+
+        st.divider()
+
+        # Show filtered cases if a metric is clicked
+        if current_filter == "all":
+            render_case_list(active, "All Active Cases")
+
+        elif current_filter == "no_capacity":
+            filtered = active[active["current_capacity"] == "No Capacity"]
+            render_case_list(filtered, "Cases - No Capacity")
+
+        elif current_filter == "modified":
+            filtered = active[active["current_capacity"] == "Modified Duties"]
+            render_case_list(filtered, "Cases - Modified Duties")
+
+        elif current_filter == "terminations":
+            st.subheader("Pending Terminations")
+            for _, t in pending_terms.iterrows():
+                with st.container(border=True):
+                    tc1, tc2, tc3, tc4 = st.columns([2, 2, 2, 1])
+                    tc1.markdown(f"\U0001f534 **{t['worker_name']}** ({t['state']})")
+                    tc2.markdown(f"**Type:** {t['termination_type']}")
+                    steps_done = sum([bool(t["letter_drafted"]), bool(t["letter_sent"]), bool(t["response_received"])])
+                    tc3.progress(steps_done / 3, text=f"{steps_done}/3 steps")
+                    case_match = active[active["worker_name"] == t["worker_name"]]
+                    if len(case_match) > 0:
+                        if tc4.button("Open", key=f"term_open_{t['case_id']}"):
+                            st.session_state.selected_case_id = int(t["case_id"])
+                            st.rerun()
+
+        elif current_filter == "expired_coc":
+            filtered = active[active["id"].isin(expired_case_ids)]
+            render_case_list(filtered, "Cases with Expired / Missing COCs")
+
+        # If no filter, show the default dashboard view
+        else:
+            # Alerts section
+            st.subheader("Alerts & Actions Required")
+
+            alerts = []
+
+            for _, row in cocs.iterrows():
+                status, color = coc_status(row["cert_to"])
+                if color in ("red", "orange"):
+                    alerts.append({
+                        "type": "COC", "severity": "URGENT" if color == "red" else "WARNING",
+                        "worker": row["worker_name"], "case_id": row["case_id"],
+                        "message": f"COC {status}", "action": "Obtain new Certificate of Capacity"
+                    })
+
+            for _, case in active.iterrows():
+                if case["id"] not in cases_with_coc and case["current_capacity"] not in ("Full Capacity",):
+                    alerts.append({
+                        "type": "COC", "severity": "WARNING",
+                        "worker": case["worker_name"], "case_id": case["id"],
+                        "message": "No COC on record", "action": "Obtain Certificate of Capacity from insurer"
+                    })
+
+            for _, t in pending_terms.iterrows():
+                alerts.append({
+                    "type": "TERMINATION", "severity": "ACTION",
+                    "worker": t["worker_name"], "case_id": t["case_id"],
+                    "message": f"Termination pending - {t['termination_type']}",
+                    "action": f"Follow up with {t['assigned_to']}"
+                })
+
+            for _, case in active.iterrows():
+                if pd.isna(case["piawe"]) and case["current_capacity"] not in ("Full Capacity",) and case["reduction_rate"] != "N/A":
+                    alerts.append({
+                        "type": "PAYROLL", "severity": "INFO",
+                        "worker": case["worker_name"], "case_id": case["id"],
+                        "message": "PIAWE data missing", "action": "Obtain PIAWE from insurer"
+                    })
+
+            if alerts:
+                for alert in sorted(alerts, key=lambda x: {"URGENT": 0, "WARNING": 1, "ACTION": 2, "INFO": 3}[x["severity"]]):
+                    icon = {"URGENT": "\U0001f6a8", "WARNING": "\u26a0\ufe0f", "ACTION": "\U0001f4cb", "INFO": "\u2139\ufe0f"}[alert["severity"]]
+                    with st.container(border=True):
+                        ac1, ac2, ac3, ac4 = st.columns([1, 2.5, 2, 0.5])
+                        ac1.markdown(f"{icon} **{alert['severity']}**")
+                        ac2.markdown(f"**{alert['worker']}** - {alert['message']}")
+                        ac3.markdown(f"*{alert['action']}*")
+                        if ac4.button("\u27a1\ufe0f", key=f"alert_{alert['case_id']}_{alert['type']}"):
+                            st.session_state.selected_case_id = int(alert["case_id"])
+                            st.rerun()
+            else:
+                st.success("No alerts - all cases are up to date!")
+
+            st.divider()
+
+            # Cases by state
+            st.subheader("Cases by State")
+            col1, col2, col3 = st.columns(3)
+
+            for col, state in [(col1, "VIC"), (col2, "NSW"), (col3, "QLD")]:
+                state_cases = active[active["state"] == state]
+                with col:
+                    st.markdown(f"### {state} ({len(state_cases)})")
+                    for _, case in state_cases.iterrows():
+                        cap_col = capacity_color(case["current_capacity"])
+                        emoji = priority_emoji(case["priority"])
+                        if st.button(
+                            f"{case['worker_name']} | {case['current_capacity']}",
+                            key=f"state_{case['id']}",
+                            use_container_width=True
+                        ):
+                            st.session_state.selected_case_id = int(case["id"])
+                            st.rerun()
 
 
 # ============================================================
 # ALL CASES PAGE
 # ============================================================
 elif page == "All Cases":
-    st.title("All Cases")
+    if st.session_state.selected_case_id:
+        render_case_detail(st.session_state.selected_case_id)
+    else:
+        st.title("All Cases")
 
-    cases_df = get_cases_df()
-    filtered = cases_df[
-        (cases_df["state"].isin(filter_state)) &
-        (cases_df["current_capacity"].isin(filter_capacity)) &
-        (cases_df["priority"].isin(filter_priority))
-    ]
+        cases_df = get_cases_df()
+        filtered = cases_df[
+            (cases_df["state"].isin(filter_state)) &
+            (cases_df["current_capacity"].isin(filter_capacity)) &
+            (cases_df["priority"].isin(filter_priority))
+        ]
 
-    tab_view, tab_add, tab_edit = st.tabs(["View Cases", "Add New Case", "Edit Case"])
+        tab_view, tab_add, tab_edit = st.tabs(["View Cases", "Add New Case", "Edit Case"])
 
-    with tab_view:
-        for _, case in filtered.iterrows():
-            cap_col = capacity_color(case["current_capacity"])
-            emoji = priority_emoji(case["priority"])
-            with st.expander(f"{emoji} {case['worker_name']} | {case['state']} - {case['site'] or ''} | :{cap_col}_circle: {case['current_capacity']}"):
-                c1, c2, c3 = st.columns(3)
-                c1.markdown(f"**Entity:** {case['entity'] or 'N/A'}")
-                c1.markdown(f"**Site:** {case['site'] or 'N/A'}")
-                c1.markdown(f"**DOI:** {case['date_of_injury'] or 'N/A'}")
-                c1.markdown(f"**Claim #:** {case['claim_number'] or 'N/A'}")
-
-                c2.markdown(f"**Capacity:** {case['current_capacity']}")
-                c2.markdown(f"**Shift:** {case['shift_structure'] or 'N/A'}")
-                c2.markdown(f"**PIAWE:** ${case['piawe']:,.2f}" if pd.notna(case['piawe']) else "**PIAWE:** Not recorded")
-                c2.markdown(f"**Reduction:** {case['reduction_rate'] or 'N/A'}")
-
-                c3.markdown(f"**Priority:** {case['priority']}")
-                c3.markdown(f"**Status:** {case['status']}")
-
-                st.markdown(f"**Injury:** {case['injury_description'] or 'N/A'}")
-                st.markdown(f"**Strategy:** {case['strategy'] or 'N/A'}")
-                st.markdown(f"**Next Action:** {case['next_action'] or 'N/A'}")
-                st.markdown(f"**Notes:** {case['notes'] or ''}")
-
-                # Document checklist
-                st.markdown("---")
-                st.markdown("**Document Checklist:**")
-                docs = get_documents(case["id"])
-                if len(docs) > 0:
-                    doc_cols = st.columns(5)
-                    for i, (_, doc) in enumerate(docs.iterrows()):
-                        col_idx = i % 5
-                        check = ":white_check_mark:" if doc["is_present"] else ":x:"
-                        doc_cols[col_idx].markdown(f"{check} {doc['doc_type']}")
+        with tab_view:
+            render_case_list(filtered)
 
     with tab_add:
         st.subheader("Add New Case")
@@ -437,12 +737,14 @@ elif page == "All Cases":
 # COC TRACKER PAGE
 # ============================================================
 elif page == "COC Tracker":
+  if st.session_state.selected_case_id:
+    render_case_detail(st.session_state.selected_case_id)
+  else:
     st.title("Certificate of Capacity Tracker")
 
     cocs = get_latest_cocs()
     cases_df = get_cases_df()
 
-    # Summary metrics
     today = date.today()
     expired = 0
     expiring = 0
@@ -471,14 +773,17 @@ elif page == "COC Tracker":
         st.subheader("Certificate Status (sorted by expiry)")
         for _, row in cocs.iterrows():
             status, color = coc_status(row["cert_to"])
-            emoji = {"red": ":red_circle:", "orange": ":orange_circle:", "green": ":green_circle:"}.get(color, ":white_circle:")
+            emoji = {"red": "\U0001f534", "orange": "\U0001f7e0", "green": "\U0001f7e2"}.get(color, "\u26aa")
 
             with st.container(border=True):
-                cc1, cc2, cc3, cc4 = st.columns([2, 2, 2, 2])
+                cc1, cc2, cc3, cc4, cc5 = st.columns([2, 2, 2, 2, 0.5])
                 cc1.markdown(f"{emoji} **{row['worker_name']}**")
                 cc2.markdown(f"**Period:** {row['cert_from']} to {row['cert_to']}")
                 cc3.markdown(f"**Capacity:** {row['capacity'] or 'N/A'}")
                 cc4.markdown(f"**Status:** {status}")
+                if cc5.button("Open", key=f"coc_open_{row['case_id']}"):
+                    st.session_state.selected_case_id = int(row["case_id"])
+                    st.rerun()
 
                 if row["days_per_week"] or row["hours_per_day"]:
                     st.caption(f"Schedule: {row['days_per_week'] or '?'} days/week, {row['hours_per_day'] or '?'} hrs/day")
@@ -527,6 +832,9 @@ elif page == "COC Tracker":
 # TERMINATIONS PAGE
 # ============================================================
 elif page == "Terminations":
+  if st.session_state.selected_case_id:
+    render_case_detail(st.session_state.selected_case_id)
+  else:
     st.title("Termination Tracker")
 
     terms = get_terminations()
@@ -549,7 +857,7 @@ elif page == "Terminations":
         for _, t in pending.iterrows():
             with st.container(border=True):
                 tc1, tc2, tc3 = st.columns([2, 2, 2])
-                tc1.markdown(f":red_circle: **{t['worker_name']}** ({t['state']})")
+                tc1.markdown(f"\U0001f534 **{t['worker_name']}** ({t['state']})")
                 tc2.markdown(f"**Type:** {t['termination_type']}")
                 tc3.markdown(f"**Assigned to:** {t['assigned_to']}")
 
@@ -565,7 +873,7 @@ elif page == "Terminations":
                 st.progress(progress / 3, text=f"Progress: {progress}/3 steps")
 
                 for step, done in steps.items():
-                    icon = ":white_check_mark:" if done else ":black_square_button:"
+                    icon = "\u2705" if done else "\u2b1b"
                     st.markdown(f"{icon} {step}")
 
                 if t["notes"]:
@@ -710,7 +1018,7 @@ elif page == "PIAWE Calculator":
                     bc3.markdown(f"Rate: {rate_str}")
                     bc4.markdown(f"Capacity: {case['current_capacity']}")
                 else:
-                    bc2.markdown(":red_circle: **PIAWE Missing**")
+                    bc2.markdown("\U0001f534 **PIAWE Missing**")
                     bc3.markdown(f"Rate: {rate_str}")
                     bc4.markdown(f"Capacity: {case['current_capacity']}")
 
