@@ -506,9 +506,8 @@ def render_case_detail(case_id):
             dcols = st.columns(2)
             for i, (_, doc) in enumerate(docs.iterrows()):
                 col = dcols[i % 2]
-                check = "\u2705" if doc["is_present"] else "\u274c"
                 doc_changes[doc["id"]] = col.checkbox(
-                    f"{check} {doc['doc_type']}", value=bool(doc["is_present"]), key=f"detail_doc_{doc['id']}"
+                    doc["doc_type"], value=bool(doc["is_present"]), key=f"detail_doc_{doc['id']}"
                 )
             if st.button("Save Checklist", key=f"save_docs_{case_id}"):
                 conn = db.get_connection()
