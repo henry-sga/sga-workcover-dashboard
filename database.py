@@ -118,6 +118,56 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS incident_details (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            case_id INTEGER NOT NULL,
+            dob TEXT,
+            occupation TEXT,
+            date_reported TEXT,
+            task_performed TEXT,
+            location_detail TEXT,
+            witnesses TEXT,
+            employment_type TEXT,
+            tenure TEXT,
+            shift_type TEXT,
+            shift_start_time TEXT,
+            nature_of_injury TEXT,
+            body_part TEXT,
+            treatment_level TEXT,
+            lost_time TEXT,
+            claim_made TEXT,
+            pre_injury_duties TEXT,
+            avg_hours TEXT,
+            FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE CASCADE
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS doctor_details (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            case_id INTEGER NOT NULL,
+            doctor_name TEXT,
+            doctor_address TEXT,
+            doctor_phone TEXT,
+            doctor_fax TEXT,
+            claims_manager TEXT,
+            FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE CASCADE
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS generated_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            case_id INTEGER NOT NULL,
+            doc_type TEXT NOT NULL,
+            doc_name TEXT NOT NULL,
+            doc_data BLOB NOT NULL,
+            generated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE CASCADE
+        )
+    """)
+
     conn.commit()
     conn.close()
 

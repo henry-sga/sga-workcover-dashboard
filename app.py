@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date, timedelta
 import database as db
+import doc_generator as dg
 
 st.set_page_config(
     page_title="SGA Workcover Dashboard",
@@ -68,6 +69,39 @@ def get_documents(case_id):
     return df
 
 
+def get_generated_documents(case_id):
+    conn = db.get_connection()
+    df = pd.read_sql_query(
+        "SELECT id, case_id, doc_type, doc_name, generated_at FROM generated_documents WHERE case_id = ? ORDER BY generated_at DESC",
+        conn, params=(case_id,)
+    )
+    conn.close()
+    return df
+
+
+def get_generated_doc_data(doc_id):
+    conn = db.get_connection()
+    row = conn.execute("SELECT doc_data, doc_name FROM generated_documents WHERE id = ?", (doc_id,)).fetchone()
+    conn.close()
+    if row:
+        return row["doc_data"], row["doc_name"]
+    return None, None
+
+
+def get_doctor_details(case_id):
+    conn = db.get_connection()
+    row = conn.execute("SELECT * FROM doctor_details WHERE case_id = ? ORDER BY id DESC LIMIT 1", (case_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def get_incident_details(case_id):
+    conn = db.get_connection()
+    row = conn.execute("SELECT * FROM incident_details WHERE case_id = ? ORDER BY id DESC LIMIT 1", (case_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
 def get_activity_log(case_id=None, limit=50):
     conn = db.get_connection()
     if case_id:
@@ -129,7 +163,6 @@ def capacity_icon(cap):
 
 
 def capacity_color(cap):
-    """Return a color name for st.progress etc."""
     if not cap:
         return "gray"
     cap_lower = cap.lower()
@@ -151,16 +184,78 @@ def coc_icon(cert_to_str):
     return {"red": "\U0001f534", "orange": "\U0001f7e0", "green": "\U0001f7e2"}.get(color, "\u26aa")
 
 
-# --- Sidebar ---
+def build_case_data_dict(case_row):
+    """Convert a case DB row/series to a dict for doc generation."""
+    if isinstance(case_row, pd.Series):
+        return case_row.to_dict()
+    return dict(case_row)
 
-st.sidebar.title("SGA Workcover")
+
+def build_medical_data(case_id, case_data):
+    """Build medical_data dict from latest COC + doctor + incident details."""
+    conn = db.get_connection()
+    cert = conn.execute(
+        "SELECT * FROM certificates WHERE case_id = ? ORDER BY cert_to DESC LIMIT 1",
+        (case_id,)
+    ).fetchone()
+    conn.close()
+
+    doctor = get_doctor_details(case_id)
+    incident = get_incident_details(case_id)
+
+    med = {}
+    if cert:
+        med["cert_from"] = cert["cert_from"]
+        med["cert_to"] = cert["cert_to"]
+        med["hours_per_day"] = cert["hours_per_day"]
+        med["days_per_week"] = cert["days_per_week"]
+    if doctor:
+        med["doctor_name"] = doctor.get("doctor_name")
+        med["doctor_address"] = doctor.get("doctor_address")
+        med["doctor_phone"] = doctor.get("doctor_phone")
+        med["doctor_fax"] = doctor.get("doctor_fax")
+    if incident:
+        med["worker_dob"] = incident.get("dob")
+        med["occupation"] = incident.get("occupation")
+    med["restrictions"] = None  # Will show [REVIEW] marker
+    return med, doctor, incident
+
+
+# --- Sidebar (styled menu) ---
+
+st.sidebar.markdown("""
+<style>
+div[data-testid="stSidebar"] .stRadio > label { display: none; }
+div.sidebar-menu-item {
+    padding: 8px 12px;
+    border-radius: 8px;
+    margin: 2px 0;
+    cursor: pointer;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.sidebar.markdown("### SGA Workcover")
 st.sidebar.caption(f"Today: {date.today().strftime('%d %b %Y')}")
 
-page = st.sidebar.radio(
+# Build styled navigation
+NAV_ITEMS = [
+    ("Dashboard", "house"),
+    ("New Case", "plus-circle"),
+    ("All Cases", "folder"),
+    ("COC Tracker", "calendar-check"),
+    ("Terminations", "x-circle"),
+    ("PIAWE Calculator", "calculator"),
+    ("Payroll", "currency-dollar"),
+    ("Activity Log", "clock-history"),
+]
+
+# Use selectbox with a cleaner look for navigation
+page = st.sidebar.selectbox(
     "Navigate",
-    ["Dashboard", "All Cases", "COC Tracker", "Terminations",
-     "PIAWE Calculator", "Payroll", "Activity Log"],
-    index=0
+    [item[0] for item in NAV_ITEMS],
+    index=0,
+    label_visibility="collapsed",
 )
 
 # Reset case selection when changing pages
@@ -182,6 +277,81 @@ filter_capacity = st.sidebar.multiselect(
 filter_priority = st.sidebar.multiselect(
     "Priority", ["HIGH", "MEDIUM", "LOW"], default=["HIGH", "MEDIUM", "LOW"]
 )
+
+
+# --- Generate Documents Dialog ---
+
+def render_generate_documents(case_id):
+    """Render the document generation UI for a case."""
+    conn = db.get_connection()
+    case = conn.execute("SELECT * FROM cases WHERE id = ?", (case_id,)).fetchone()
+    conn.close()
+    if not case:
+        st.error("Case not found")
+        return
+
+    case_data = dict(case)
+    medical_data, doctor_data, incident_data = build_medical_data(case_id, case_data)
+
+    st.markdown("#### Generate Documents")
+    st.caption("Select which documents to generate. They will be pre-filled with available case data.")
+
+    # Show available documents with checkboxes
+    selected_docs = {}
+    for doc_key, doc_info in dg.AVAILABLE_DOCUMENTS.items():
+        review_badge = ""
+        if "Yes" in doc_info["needs_review"]:
+            review_badge = "  :orange[Needs Review]"
+        elif "Minimal" in doc_info["needs_review"]:
+            review_badge = "  :blue[Minimal Review]"
+        else:
+            review_badge = "  :green[Ready to Use]"
+
+        selected_docs[doc_key] = st.checkbox(
+            f"{doc_info['icon']}  **{doc_info['name']}** - {doc_info['description']}{review_badge}",
+            key=f"gen_doc_{case_id}_{doc_key}",
+            value=False,
+        )
+
+    any_selected = any(selected_docs.values())
+
+    if st.button("Generate Selected Documents", disabled=not any_selected, type="primary",
+                 key=f"gen_btn_{case_id}"):
+        docs_to_generate = [k for k, v in selected_docs.items() if v]
+
+        with st.spinner("Generating documents..."):
+            results = dg.generate_documents(
+                case_data, docs_to_generate,
+                medical_data=medical_data,
+                doctor_data=doctor_data,
+                incident_data=incident_data,
+            )
+
+        # Save to DB and provide downloads
+        conn = db.get_connection()
+        for doc_type, (filename, buf) in results.items():
+            conn.execute(
+                "INSERT INTO generated_documents (case_id, doc_type, doc_name, doc_data) VALUES (?, ?, ?, ?)",
+                (case_id, doc_type, filename, buf.getvalue())
+            )
+        conn.commit()
+        conn.close()
+
+        log_activity(case_id, "Documents Generated",
+                     f"Generated: {', '.join(dg.AVAILABLE_DOCUMENTS[k]['name'] for k in docs_to_generate)}")
+
+        st.success(f"Generated {len(results)} document(s)!")
+
+        # Show download buttons
+        for doc_type, (filename, buf) in results.items():
+            info = dg.AVAILABLE_DOCUMENTS[doc_type]
+            st.download_button(
+                label=f"Download {info['icon']} {info['name']}",
+                data=buf.getvalue(),
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key=f"dl_{case_id}_{doc_type}_{datetime.now().timestamp()}",
+            )
 
 
 # --- Case detail renderer (reused across pages) ---
@@ -215,8 +385,8 @@ def render_case_detail(case_id):
     st.caption(f"{c['state']} | {c['entity'] or ''} - {c['site'] or ''} | Priority: {c['priority']}")
 
     # Key info tabs
-    tab_overview, tab_medical, tab_docs, tab_payroll, tab_history = st.tabs(
-        ["Overview", "Medical / COCs", "Documents", "Payroll", "History"]
+    tab_overview, tab_medical, tab_docs, tab_generate, tab_payroll, tab_history = st.tabs(
+        ["Overview", "Medical / COCs", "Documents", "Generate Docs", "Payroll", "History"]
     )
 
     with tab_overview:
@@ -353,6 +523,35 @@ def render_case_detail(case_id):
         present_count = len(docs[docs["is_present"] == 1]) if len(docs) > 0 else 0
         total_docs = len(docs) if len(docs) > 0 else 1
         st.progress(present_count / total_docs, text=f"{present_count}/{total_docs} documents on file")
+
+        # Generated documents section
+        st.divider()
+        st.markdown("#### Generated Documents")
+        gen_docs = get_generated_documents(case_id)
+        if len(gen_docs) > 0:
+            for _, gdoc in gen_docs.iterrows():
+                doc_info = dg.AVAILABLE_DOCUMENTS.get(gdoc["doc_type"], {})
+                icon = doc_info.get("icon", "")
+                with st.container(border=True):
+                    gc1, gc2, gc3 = st.columns([3, 2, 1])
+                    gc1.markdown(f"{icon} **{gdoc['doc_name']}**")
+                    gc2.caption(f"Generated: {gdoc['generated_at'][:16] if gdoc['generated_at'] else ''}")
+
+                    # Download button that lets user open/view the document
+                    doc_data, doc_name = get_generated_doc_data(int(gdoc["id"]))
+                    if doc_data:
+                        gc3.download_button(
+                            label="Open",
+                            data=doc_data,
+                            file_name=doc_name,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"open_gdoc_{gdoc['id']}",
+                        )
+        else:
+            st.info("No documents generated yet. Use the 'Generate Docs' tab to create documents.")
+
+    with tab_generate:
+        render_generate_documents(case_id)
 
     with tab_payroll:
         st.markdown("#### Payroll History")
@@ -591,6 +790,382 @@ if page == "Dashboard":
 
 
 # ============================================================
+# NEW CASE PAGE
+# ============================================================
+elif page == "New Case":
+    st.title("New Case Wizard")
+    st.caption("Create a new workcover case and generate all required documents in one go.")
+
+    # Use session state to track wizard steps
+    if "wizard_step" not in st.session_state:
+        st.session_state.wizard_step = 1
+
+    step = st.session_state.wizard_step
+
+    # Progress indicator
+    steps_labels = ["Worker & Incident", "Medical Details", "Generate Documents"]
+    sc1, sc2, sc3 = st.columns(3)
+    for i, (col, label) in enumerate(zip([sc1, sc2, sc3], steps_labels), 1):
+        if i < step:
+            col.markdown(f":green_circle: ~~**Step {i}:** {label}~~")
+        elif i == step:
+            col.markdown(f":large_blue_circle: **Step {i}:** {label}")
+        else:
+            col.markdown(f":white_circle: Step {i}: {label}")
+
+    st.divider()
+
+    # ── STEP 1: Worker & Incident Details ──
+    if step == 1:
+        st.subheader("Step 1: Worker & Incident Details")
+
+        with st.form("wizard_step1"):
+            st.markdown("**Worker Information**")
+            w1, w2 = st.columns(2)
+            wiz_name = w1.text_input("Worker Name*")
+            wiz_dob = w2.date_input("Date of Birth", value=None)
+            wiz_address = w1.text_input("Address")
+            wiz_phone = w2.text_input("Phone")
+            wiz_language = w1.text_input("Language Needs (if any)")
+
+            st.markdown("**Employer Details**")
+            e1, e2, e3 = st.columns(3)
+            wiz_entity = e1.text_input("Entity")
+            wiz_site = e2.text_input("Site")
+            wiz_state = e3.selectbox("State*", ["VIC", "NSW", "QLD", "TAS", "SA", "WA"])
+
+            st.markdown("**Incident Details**")
+            i1, i2, i3 = st.columns(3)
+            wiz_doi = i1.date_input("Date of Injury*")
+            wiz_time = i2.time_input("Time of Injury")
+            wiz_location = i3.text_input("Location within Site")
+            wiz_description = st.text_area("What Happened?*")
+            wiz_witnesses = st.text_input("Witnesses")
+
+            st.markdown("**Employment Details**")
+            emp1, emp2 = st.columns(2)
+            wiz_emp_type = emp1.selectbox("Employment Type", ["Permanent Employee", "Casual Employee", "Contractor"])
+            wiz_tenure = emp2.text_input("Tenure (e.g. 2 years 3 months)")
+            emp3, emp4 = st.columns(2)
+            wiz_avg_hours = emp3.text_input("Average Hours/Days per Week (e.g. 38 hrs/5 days)")
+            wiz_shift_type = emp4.selectbox("Shift", ["Day", "Afternoon", "Night"])
+            wiz_shift_start = st.text_input("Shift Start Time (e.g. 6:00am)")
+
+            st.markdown("**Injury Details**")
+            inj1, inj2 = st.columns(2)
+            wiz_nature = inj1.text_input("Nature of Injury (e.g. sprain, fracture)")
+            wiz_body_part = inj2.text_input("Body Part Affected")
+            wiz_treatment = st.selectbox("Treatment Level", ["No treatment", "First Aid", "Doctor", "Hospital"])
+            wiz_pre_injury = st.text_area("Pre-injury Duties Description")
+
+            if st.form_submit_button("Next: Medical Details", type="primary"):
+                if not wiz_name:
+                    st.error("Worker name is required")
+                elif not wiz_description:
+                    st.error("Injury description is required")
+                else:
+                    # Store in session state
+                    st.session_state.wizard_data = {
+                        "worker_name": wiz_name,
+                        "dob": wiz_dob.isoformat() if wiz_dob else None,
+                        "address": wiz_address,
+                        "phone": wiz_phone,
+                        "language": wiz_language,
+                        "entity": wiz_entity,
+                        "site": wiz_site,
+                        "state": wiz_state,
+                        "date_of_injury": wiz_doi.isoformat() if wiz_doi else None,
+                        "time_of_injury": wiz_time.strftime("%H:%M") if wiz_time else None,
+                        "location_detail": wiz_location,
+                        "injury_description": wiz_description,
+                        "witnesses": wiz_witnesses,
+                        "employment_type": wiz_emp_type,
+                        "tenure": wiz_tenure,
+                        "avg_hours": wiz_avg_hours,
+                        "shift_type": wiz_shift_type,
+                        "shift_start_time": wiz_shift_start,
+                        "nature_of_injury": wiz_nature,
+                        "body_part": wiz_body_part,
+                        "treatment_level": wiz_treatment,
+                        "pre_injury_duties": wiz_pre_injury,
+                    }
+                    st.session_state.wizard_step = 2
+                    st.rerun()
+
+    # ── STEP 2: Medical Details ──
+    elif step == 2:
+        st.subheader("Step 2: Medical Details")
+
+        if st.button("Back to Step 1"):
+            st.session_state.wizard_step = 1
+            st.rerun()
+
+        with st.form("wizard_step2"):
+            st.markdown("**Treating Doctor**")
+            d1, d2 = st.columns(2)
+            wiz_doc_name = d1.text_input("Doctor Name")
+            wiz_doc_phone = d2.text_input("Doctor Phone")
+            wiz_doc_address = st.text_input("Doctor Address")
+            wiz_doc_fax = d1.text_input("Doctor Fax")
+
+            st.markdown("**Initial Certificate of Capacity**")
+            c1, c2 = st.columns(2)
+            wiz_cert_from = c1.date_input("COC From")
+            wiz_cert_to = c2.date_input("COC To")
+            wiz_capacity = st.selectbox("Current Capacity", ["No Capacity", "Modified Duties", "Full Capacity", "Uncertain"])
+            c3, c4 = st.columns(2)
+            wiz_days_pw = c3.number_input("Days per Week", min_value=0, max_value=7, value=0)
+            wiz_hrs_pd = c4.number_input("Hours per Day", min_value=0.0, max_value=24.0, value=0.0, step=0.5)
+            wiz_restrictions = st.text_area("Restrictions / Constraints")
+
+            st.markdown("**Claim Details**")
+            cl1, cl2 = st.columns(2)
+            wiz_claim = cl1.text_input("Claim Number (if known)")
+            wiz_piawe = cl2.number_input("PIAWE ($)", min_value=0.0, value=0.0, step=0.01)
+            wiz_reduction = cl1.selectbox("Reduction Rate", ["95%", "80%", "N/A"])
+            wiz_shift_structure = cl2.text_input("Shift Structure (e.g. 5 hrs x 3 days)")
+
+            st.markdown("**Strategy & Actions**")
+            wiz_strategy = st.text_area("Strategy")
+            wiz_next_action = st.text_area("Next Action Required")
+            wiz_notes = st.text_area("Notes")
+
+            if st.form_submit_button("Next: Generate Documents", type="primary"):
+                wd = st.session_state.wizard_data
+                wd.update({
+                    "doctor_name": wiz_doc_name,
+                    "doctor_phone": wiz_doc_phone,
+                    "doctor_address": wiz_doc_address,
+                    "doctor_fax": wiz_doc_fax,
+                    "cert_from": wiz_cert_from.isoformat(),
+                    "cert_to": wiz_cert_to.isoformat(),
+                    "current_capacity": wiz_capacity,
+                    "days_per_week": wiz_days_pw if wiz_days_pw > 0 else None,
+                    "hours_per_day": wiz_hrs_pd if wiz_hrs_pd > 0 else None,
+                    "restrictions": wiz_restrictions,
+                    "claim_number": wiz_claim or None,
+                    "piawe": wiz_piawe if wiz_piawe > 0 else None,
+                    "reduction_rate": wiz_reduction,
+                    "shift_structure": wiz_shift_structure,
+                    "strategy": wiz_strategy,
+                    "next_action": wiz_next_action,
+                    "notes": wiz_notes,
+                })
+                st.session_state.wizard_step = 3
+                st.rerun()
+
+    # ── STEP 3: Generate Documents ──
+    elif step == 3:
+        st.subheader("Step 3: Review & Generate Documents")
+
+        if st.button("Back to Step 2"):
+            st.session_state.wizard_step = 2
+            st.rerun()
+
+        wd = st.session_state.get("wizard_data", {})
+
+        # Show summary
+        with st.expander("Case Summary", expanded=True):
+            s1, s2 = st.columns(2)
+            s1.markdown(f"**Worker:** {wd.get('worker_name', 'N/A')}")
+            s1.markdown(f"**State:** {wd.get('state', 'N/A')}")
+            s1.markdown(f"**Entity / Site:** {wd.get('entity', '')} - {wd.get('site', '')}")
+            s1.markdown(f"**Date of Injury:** {wd.get('date_of_injury', 'N/A')}")
+            s2.markdown(f"**Injury:** {wd.get('injury_description', 'N/A')}")
+            s2.markdown(f"**Capacity:** {wd.get('current_capacity', 'N/A')}")
+            s2.markdown(f"**Claim #:** {wd.get('claim_number', 'N/A')}")
+            s2.markdown(f"**Doctor:** {wd.get('doctor_name', 'N/A')}")
+
+        # Document selection
+        st.markdown("#### Select Documents to Generate")
+        selected_docs = {}
+        for doc_key, doc_info in dg.AVAILABLE_DOCUMENTS.items():
+            review_badge = ""
+            if "Yes" in doc_info["needs_review"]:
+                review_badge = "  :orange[Needs Review]"
+            elif "Minimal" in doc_info["needs_review"]:
+                review_badge = "  :blue[Minimal Review]"
+            else:
+                review_badge = "  :green[Ready to Use]"
+
+            selected_docs[doc_key] = st.checkbox(
+                f"{doc_info['icon']}  **{doc_info['name']}** - {doc_info['description']}{review_badge}",
+                key=f"wiz_doc_{doc_key}",
+                value=True,  # Default all selected for new case
+            )
+
+        st.divider()
+
+        col_create, col_cancel = st.columns([3, 1])
+
+        with col_create:
+            if st.button("Create Case & Generate Documents", type="primary", use_container_width=True):
+                # 1. Create case in DB
+                conn = db.get_connection()
+                conn.execute("""
+                    INSERT INTO cases (worker_name, state, entity, site, date_of_injury,
+                        injury_description, current_capacity, shift_structure, piawe,
+                        reduction_rate, claim_number, priority, strategy, next_action, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (wd.get("worker_name"), wd.get("state"), wd.get("entity"), wd.get("site"),
+                      wd.get("date_of_injury"), wd.get("injury_description"),
+                      wd.get("current_capacity", "Unknown"),
+                      wd.get("shift_structure"),
+                      wd.get("piawe"),
+                      wd.get("reduction_rate", "95%"),
+                      wd.get("claim_number"),
+                      "MEDIUM",
+                      wd.get("strategy"), wd.get("next_action"), wd.get("notes")))
+                conn.commit()
+                case_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+                # 2. Create document checklist
+                doc_types = [
+                    "Incident Report", "Claim Form", "Payslips (12 months)",
+                    "PIAWE Calculation", "Certificate of Capacity (Current)",
+                    "RTW Plan (Current)", "Suitable Duties Plan", "Medical Certificates",
+                    "Insurance Correspondence", "Wage Records"
+                ]
+                for dt in doc_types:
+                    conn.execute("INSERT INTO documents (case_id, doc_type) VALUES (?, ?)", (case_id, dt))
+
+                # 3. Save COC if provided
+                if wd.get("cert_from") and wd.get("cert_to"):
+                    conn.execute("""
+                        INSERT INTO certificates (case_id, cert_from, cert_to, capacity, days_per_week, hours_per_day)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (case_id, wd["cert_from"], wd["cert_to"],
+                          wd.get("current_capacity"), wd.get("days_per_week"), wd.get("hours_per_day")))
+
+                # 4. Save incident details
+                conn.execute("""
+                    INSERT INTO incident_details (case_id, dob, occupation, date_reported,
+                        task_performed, location_detail, witnesses, employment_type, tenure,
+                        shift_type, shift_start_time, nature_of_injury, body_part,
+                        treatment_level, pre_injury_duties, avg_hours)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (case_id, wd.get("dob"), wd.get("pre_injury_duties"),
+                      wd.get("date_of_injury"), wd.get("injury_description"),
+                      wd.get("location_detail"), wd.get("witnesses"),
+                      wd.get("employment_type"), wd.get("tenure"),
+                      wd.get("shift_type"), wd.get("shift_start_time"),
+                      wd.get("nature_of_injury"), wd.get("body_part"),
+                      wd.get("treatment_level"), wd.get("pre_injury_duties"),
+                      wd.get("avg_hours")))
+
+                # 5. Save doctor details
+                if wd.get("doctor_name"):
+                    conn.execute("""
+                        INSERT INTO doctor_details (case_id, doctor_name, doctor_address, doctor_phone, doctor_fax)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (case_id, wd.get("doctor_name"), wd.get("doctor_address"),
+                          wd.get("doctor_phone"), wd.get("doctor_fax")))
+
+                conn.commit()
+                conn.close()
+
+                log_activity(case_id, "Case Created", f"New case via wizard for {wd.get('worker_name')}")
+
+                # 6. Generate selected documents
+                docs_to_generate = [k for k, v in selected_docs.items() if v]
+                if docs_to_generate:
+                    case_data = wd.copy()
+                    medical_data = {
+                        "cert_from": wd.get("cert_from"),
+                        "cert_to": wd.get("cert_to"),
+                        "hours_per_day": wd.get("hours_per_day"),
+                        "days_per_week": wd.get("days_per_week"),
+                        "restrictions": wd.get("restrictions"),
+                        "doctor_name": wd.get("doctor_name"),
+                        "doctor_address": wd.get("doctor_address"),
+                        "doctor_phone": wd.get("doctor_phone"),
+                        "doctor_fax": wd.get("doctor_fax"),
+                        "worker_dob": wd.get("dob"),
+                        "worker_address": wd.get("address"),
+                        "worker_phone": wd.get("phone"),
+                        "interpreter_needed": "Yes" if wd.get("language") else "No",
+                        "occupation": wd.get("pre_injury_duties"),
+                    }
+                    doctor_data = {
+                        "doctor_name": wd.get("doctor_name"),
+                        "doctor_address": wd.get("doctor_address"),
+                        "doctor_phone": wd.get("doctor_phone"),
+                        "doctor_fax": wd.get("doctor_fax"),
+                    }
+                    incident_data = {
+                        "dob": wd.get("dob"),
+                        "occupation": wd.get("pre_injury_duties"),
+                        "task_performed": wd.get("injury_description"),
+                        "location_detail": wd.get("location_detail"),
+                        "witnesses": wd.get("witnesses"),
+                        "employment_type": wd.get("employment_type"),
+                        "tenure": wd.get("tenure"),
+                        "shift_type": wd.get("shift_type"),
+                        "shift_start_time": wd.get("shift_start_time"),
+                        "nature_of_injury": wd.get("nature_of_injury"),
+                        "body_part": wd.get("body_part"),
+                        "treatment_level": wd.get("treatment_level"),
+                    }
+
+                    with st.spinner("Generating documents..."):
+                        results = dg.generate_documents(
+                            case_data, docs_to_generate,
+                            medical_data=medical_data,
+                            doctor_data=doctor_data,
+                            incident_data=incident_data,
+                        )
+
+                    # Save generated docs to DB
+                    conn = db.get_connection()
+                    for doc_type, (filename, buf) in results.items():
+                        conn.execute(
+                            "INSERT INTO generated_documents (case_id, doc_type, doc_name, doc_data) VALUES (?, ?, ?, ?)",
+                            (case_id, doc_type, filename, buf.getvalue())
+                        )
+                    conn.commit()
+                    conn.close()
+
+                    log_activity(case_id, "Documents Generated",
+                                 f"Generated via wizard: {', '.join(dg.AVAILABLE_DOCUMENTS[k]['name'] for k in docs_to_generate)}")
+
+                    st.success(f"Case created and {len(results)} document(s) generated!")
+                    st.balloons()
+
+                    # Show download buttons
+                    st.markdown("#### Download Generated Documents")
+                    for doc_type, (filename, buf) in results.items():
+                        info = dg.AVAILABLE_DOCUMENTS[doc_type]
+                        st.download_button(
+                            label=f"Download {info['icon']} {info['name']}",
+                            data=buf.getvalue(),
+                            file_name=filename,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"wiz_dl_{doc_type}",
+                        )
+
+                    st.markdown("---")
+                    if st.button("Open Case", type="primary"):
+                        st.session_state.selected_case_id = case_id
+                        st.session_state.wizard_step = 1
+                        st.session_state.last_page = "Dashboard"
+                        st.rerun()
+                else:
+                    st.success(f"Case created for {wd.get('worker_name')}!")
+                    if st.button("Open Case", type="primary"):
+                        st.session_state.selected_case_id = case_id
+                        st.session_state.wizard_step = 1
+                        st.session_state.last_page = "Dashboard"
+                        st.rerun()
+
+        with col_cancel:
+            if st.button("Cancel", use_container_width=True):
+                st.session_state.wizard_step = 1
+                if "wizard_data" in st.session_state:
+                    del st.session_state.wizard_data
+                st.rerun()
+
+
+# ============================================================
 # ALL CASES PAGE
 # ============================================================
 elif page == "All Cases":
@@ -611,126 +1186,127 @@ elif page == "All Cases":
         with tab_view:
             render_case_list(filtered)
 
-    with tab_add:
-        st.subheader("Add New Case")
-        with st.form("add_case_form"):
-            ac1, ac2 = st.columns(2)
-            new_name = ac1.text_input("Worker Name*")
-            new_state = ac2.selectbox("State*", ["VIC", "NSW", "QLD", "TAS", "SA", "WA"])
-            new_entity = ac1.text_input("Entity")
-            new_site = ac2.text_input("Site")
-            new_doi = ac1.date_input("Date of Injury", value=None)
-            new_capacity = ac2.selectbox("Current Capacity", ["No Capacity", "Modified Duties", "Full Capacity", "Uncertain", "Unknown"])
-            new_injury = st.text_area("Injury Description")
-            new_shift = ac1.text_input("Shift Structure")
-            new_piawe = ac2.number_input("PIAWE ($)", min_value=0.0, value=0.0, step=0.01)
-            new_reduction = ac1.selectbox("Reduction Rate", ["95%", "80%", "N/A"])
-            new_claim = ac2.text_input("Claim Number")
-            new_priority = ac1.selectbox("Priority", ["HIGH", "MEDIUM", "LOW"])
-            new_strategy = st.text_area("Strategy")
-            new_next = st.text_area("Next Action Required")
-            new_notes = st.text_area("Notes")
+        with tab_add:
+            st.subheader("Add New Case")
+            st.info("For a full case setup with automatic document generation, use the **New Case** page from the sidebar.")
+            with st.form("add_case_form"):
+                ac1, ac2 = st.columns(2)
+                new_name = ac1.text_input("Worker Name*")
+                new_state = ac2.selectbox("State*", ["VIC", "NSW", "QLD", "TAS", "SA", "WA"])
+                new_entity = ac1.text_input("Entity")
+                new_site = ac2.text_input("Site")
+                new_doi = ac1.date_input("Date of Injury", value=None)
+                new_capacity = ac2.selectbox("Current Capacity", ["No Capacity", "Modified Duties", "Full Capacity", "Uncertain", "Unknown"])
+                new_injury = st.text_area("Injury Description")
+                new_shift = ac1.text_input("Shift Structure")
+                new_piawe = ac2.number_input("PIAWE ($)", min_value=0.0, value=0.0, step=0.01)
+                new_reduction = ac1.selectbox("Reduction Rate", ["95%", "80%", "N/A"])
+                new_claim = ac2.text_input("Claim Number")
+                new_priority = ac1.selectbox("Priority", ["HIGH", "MEDIUM", "LOW"])
+                new_strategy = st.text_area("Strategy")
+                new_next = st.text_area("Next Action Required")
+                new_notes = st.text_area("Notes")
 
-            submitted = st.form_submit_button("Add Case")
-            if submitted and new_name:
-                conn = db.get_connection()
-                conn.execute("""
-                    INSERT INTO cases (worker_name, state, entity, site, date_of_injury,
-                        injury_description, current_capacity, shift_structure, piawe,
-                        reduction_rate, claim_number, priority, strategy, next_action, notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (new_name, new_state, new_entity, new_site,
-                      new_doi.isoformat() if new_doi else None,
-                      new_injury, new_capacity, new_shift,
-                      new_piawe if new_piawe > 0 else None,
-                      new_reduction, new_claim or None, new_priority,
-                      new_strategy, new_next, new_notes))
-                conn.commit()
-                case_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-                # Create document checklist
-                doc_types = [
-                    "Incident Report", "Claim Form", "Payslips (12 months)",
-                    "PIAWE Calculation", "Certificate of Capacity (Current)",
-                    "RTW Plan (Current)", "Suitable Duties Plan", "Medical Certificates",
-                    "Insurance Correspondence", "Wage Records"
-                ]
-                for dt in doc_types:
-                    conn.execute("INSERT INTO documents (case_id, doc_type) VALUES (?, ?)", (case_id, dt))
-                conn.commit()
-                conn.close()
-                log_activity(case_id, "Case Created", f"New case added for {new_name}")
-                st.success(f"Case added for {new_name}!")
-                st.rerun()
-
-    with tab_edit:
-        st.subheader("Edit Case")
-        cases_list = cases_df["worker_name"].tolist()
-        selected_name = st.selectbox("Select Case to Edit", cases_list)
-        if selected_name:
-            case = cases_df[cases_df["worker_name"] == selected_name].iloc[0]
-            with st.form("edit_case_form"):
-                ec1, ec2 = st.columns(2)
-                edit_capacity = ec1.selectbox("Current Capacity",
-                    ["No Capacity", "Modified Duties", "Full Capacity", "Uncertain", "Unknown"],
-                    index=["No Capacity", "Modified Duties", "Full Capacity", "Uncertain", "Unknown"].index(case["current_capacity"]) if case["current_capacity"] in ["No Capacity", "Modified Duties", "Full Capacity", "Uncertain", "Unknown"] else 4
-                )
-                edit_shift = ec2.text_input("Shift Structure", value=case["shift_structure"] or "")
-                edit_piawe = ec1.number_input("PIAWE ($)", min_value=0.0, value=float(case["piawe"]) if pd.notna(case["piawe"]) else 0.0, step=0.01)
-                edit_reduction = ec2.selectbox("Reduction Rate", ["95%", "80%", "N/A"],
-                    index=["95%", "80%", "N/A"].index(case["reduction_rate"]) if case["reduction_rate"] in ["95%", "80%", "N/A"] else 2
-                )
-                priorities = ["HIGH", "MEDIUM", "LOW"]
-                edit_priority = ec1.selectbox("Priority", priorities,
-                    index=priorities.index(case["priority"]) if case["priority"] in priorities else 1
-                )
-                statuses = ["Active", "Closed", "Pending Closure"]
-                edit_status = ec2.selectbox("Status", statuses,
-                    index=statuses.index(case["status"]) if case["status"] in statuses else 0
-                )
-                edit_strategy = st.text_area("Strategy", value=case["strategy"] or "")
-                edit_next = st.text_area("Next Action", value=case["next_action"] or "")
-                edit_notes = st.text_area("Notes", value=case["notes"] or "")
-
-                save = st.form_submit_button("Save Changes")
-                if save:
+                submitted = st.form_submit_button("Add Case")
+                if submitted and new_name:
                     conn = db.get_connection()
                     conn.execute("""
-                        UPDATE cases SET current_capacity=?, shift_structure=?, piawe=?,
-                            reduction_rate=?, priority=?, status=?, strategy=?,
-                            next_action=?, notes=?, updated_at=CURRENT_TIMESTAMP
-                        WHERE id=?
-                    """, (edit_capacity, edit_shift,
-                          edit_piawe if edit_piawe > 0 else None,
-                          edit_reduction, edit_priority, edit_status,
-                          edit_strategy, edit_next, edit_notes, int(case["id"])))
+                        INSERT INTO cases (worker_name, state, entity, site, date_of_injury,
+                            injury_description, current_capacity, shift_structure, piawe,
+                            reduction_rate, claim_number, priority, strategy, next_action, notes)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (new_name, new_state, new_entity, new_site,
+                          new_doi.isoformat() if new_doi else None,
+                          new_injury, new_capacity, new_shift,
+                          new_piawe if new_piawe > 0 else None,
+                          new_reduction, new_claim or None, new_priority,
+                          new_strategy, new_next, new_notes))
+                    conn.commit()
+                    case_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+                    # Create document checklist
+                    doc_types = [
+                        "Incident Report", "Claim Form", "Payslips (12 months)",
+                        "PIAWE Calculation", "Certificate of Capacity (Current)",
+                        "RTW Plan (Current)", "Suitable Duties Plan", "Medical Certificates",
+                        "Insurance Correspondence", "Wage Records"
+                    ]
+                    for dt in doc_types:
+                        conn.execute("INSERT INTO documents (case_id, doc_type) VALUES (?, ?)", (case_id, dt))
                     conn.commit()
                     conn.close()
-                    log_activity(int(case["id"]), "Case Updated", f"Updated details for {selected_name}")
-                    st.success("Case updated!")
+                    log_activity(case_id, "Case Created", f"New case added for {new_name}")
+                    st.success(f"Case added for {new_name}!")
                     st.rerun()
 
-            # Document checklist update
-            st.markdown("---")
-            st.markdown("**Update Document Checklist:**")
-            docs = get_documents(int(case["id"]))
-            if len(docs) > 0:
-                doc_changes = {}
-                dcols = st.columns(2)
-                for i, (_, doc) in enumerate(docs.iterrows()):
-                    col = dcols[i % 2]
-                    doc_changes[doc["id"]] = col.checkbox(
-                        doc["doc_type"], value=bool(doc["is_present"]), key=f"doc_{doc['id']}"
+        with tab_edit:
+            st.subheader("Edit Case")
+            cases_list = cases_df["worker_name"].tolist()
+            selected_name = st.selectbox("Select Case to Edit", cases_list)
+            if selected_name:
+                case = cases_df[cases_df["worker_name"] == selected_name].iloc[0]
+                with st.form("edit_case_form"):
+                    ec1, ec2 = st.columns(2)
+                    edit_capacity = ec1.selectbox("Current Capacity",
+                        ["No Capacity", "Modified Duties", "Full Capacity", "Uncertain", "Unknown"],
+                        index=["No Capacity", "Modified Duties", "Full Capacity", "Uncertain", "Unknown"].index(case["current_capacity"]) if case["current_capacity"] in ["No Capacity", "Modified Duties", "Full Capacity", "Uncertain", "Unknown"] else 4
                     )
-                if st.button("Save Document Checklist"):
-                    conn = db.get_connection()
-                    for doc_id, present in doc_changes.items():
-                        conn.execute("UPDATE documents SET is_present=? WHERE id=?", (int(present), int(doc_id)))
-                    conn.commit()
-                    conn.close()
-                    log_activity(int(case["id"]), "Documents Updated", f"Document checklist updated for {selected_name}")
-                    st.success("Document checklist saved!")
-                    st.rerun()
+                    edit_shift = ec2.text_input("Shift Structure", value=case["shift_structure"] or "")
+                    edit_piawe = ec1.number_input("PIAWE ($)", min_value=0.0, value=float(case["piawe"]) if pd.notna(case["piawe"]) else 0.0, step=0.01)
+                    edit_reduction = ec2.selectbox("Reduction Rate", ["95%", "80%", "N/A"],
+                        index=["95%", "80%", "N/A"].index(case["reduction_rate"]) if case["reduction_rate"] in ["95%", "80%", "N/A"] else 2
+                    )
+                    priorities = ["HIGH", "MEDIUM", "LOW"]
+                    edit_priority = ec1.selectbox("Priority", priorities,
+                        index=priorities.index(case["priority"]) if case["priority"] in priorities else 1
+                    )
+                    statuses = ["Active", "Closed", "Pending Closure"]
+                    edit_status = ec2.selectbox("Status", statuses,
+                        index=statuses.index(case["status"]) if case["status"] in statuses else 0
+                    )
+                    edit_strategy = st.text_area("Strategy", value=case["strategy"] or "")
+                    edit_next = st.text_area("Next Action", value=case["next_action"] or "")
+                    edit_notes = st.text_area("Notes", value=case["notes"] or "")
+
+                    save = st.form_submit_button("Save Changes")
+                    if save:
+                        conn = db.get_connection()
+                        conn.execute("""
+                            UPDATE cases SET current_capacity=?, shift_structure=?, piawe=?,
+                                reduction_rate=?, priority=?, status=?, strategy=?,
+                                next_action=?, notes=?, updated_at=CURRENT_TIMESTAMP
+                            WHERE id=?
+                        """, (edit_capacity, edit_shift,
+                              edit_piawe if edit_piawe > 0 else None,
+                              edit_reduction, edit_priority, edit_status,
+                              edit_strategy, edit_next, edit_notes, int(case["id"])))
+                        conn.commit()
+                        conn.close()
+                        log_activity(int(case["id"]), "Case Updated", f"Updated details for {selected_name}")
+                        st.success("Case updated!")
+                        st.rerun()
+
+                # Document checklist update
+                st.markdown("---")
+                st.markdown("**Update Document Checklist:**")
+                docs = get_documents(int(case["id"]))
+                if len(docs) > 0:
+                    doc_changes = {}
+                    dcols = st.columns(2)
+                    for i, (_, doc) in enumerate(docs.iterrows()):
+                        col = dcols[i % 2]
+                        doc_changes[doc["id"]] = col.checkbox(
+                            doc["doc_type"], value=bool(doc["is_present"]), key=f"doc_{doc['id']}"
+                        )
+                    if st.button("Save Document Checklist"):
+                        conn = db.get_connection()
+                        for doc_id, present in doc_changes.items():
+                            conn.execute("UPDATE documents SET is_present=? WHERE id=?", (int(present), int(doc_id)))
+                        conn.commit()
+                        conn.close()
+                        log_activity(int(case["id"]), "Documents Updated", f"Document checklist updated for {selected_name}")
+                        st.success("Document checklist saved!")
+                        st.rerun()
 
 
 # ============================================================
